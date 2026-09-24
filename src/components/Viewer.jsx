@@ -181,19 +181,27 @@ function PlaneOutline({ w, h, ...props }) {
 }
 
 /*
-  SECTION CAPS — fills cut faces with solid black (stencil capping, as in three.js's
-  webgl_clipping_stencil example). Per plane: the model's back faces increment the stencil and
-  its front faces decrement it, both clipped by that plane only, so pixels where the cut exposes
-  the model's interior end up non-zero. A large black quad on the plane is then drawn only where
-  the stencil is non-zero (clipped by the other planes), and resets the stencil as it goes.
-  Needs closed geometry; transparent meshes (glass, usually a single surface) are skipped.
+  SECTION CAPS — fills cut faces with solid black. Per plane, a cap pixel needs TWO tests to agree,
+  because real exports (open walls with faces deleted, flipped normals) defeat either one alone:
 
-  Only pieces the plane actually passes through are counted. Otherwise any open shape anywhere
-  along the view ray (a single-face light panel behind a wall) leaves the count uneven and a
-  black patch appears in front of it. Models often merge many objects into one mesh, so this is
-  decided per connected piece of geometry, on the GPU, from per-piece bounds baked once below.
+  1. INSIDE COUNT (classic even/odd, as in three.js's webgl_clipping_stencil): along the view
+     ray, the model's back faces +1 and front faces -1, clipped by this plane only. Non-zero
+     means the ray crosses the cut inside a solid. Fooled by gaps in open meshes, which draw
+     stray lines "through" floors — but there the visible surface is the floor's front face.
+  2. VISIBLE INSIDE: a cut solid shows its inside, so a back face must be the surface actually
+     on screen (drawn after the model, depth-tested against it, clipped like the model). Fooled
+     by faces with flipped normals — but there the inside count says "outside".
+
+  Test 2 sets stencil bit 0x80; test 1 counts in the low 7 bits. A black quad on the plane is
+  drawn only where both hold (stencil > 0x80), clipped by the other planes; the stencil is then
+  cleared for the next plane.
+
+  Only pieces the plane passes through take part, decided per connected piece since exports
+  merge many objects into one mesh. Open pieces that are thin or small (cables, door and window
+  frames) are skipped: they can't be capped reliably. Transparent groups (glass) are skipped.
 */
-const stencilBase = { depthWrite: false, depthTest: false, colorWrite: false, stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc }
+const stencilOff = { colorWrite: false, depthWrite: false, stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc }
+const INSIDE = 0x80
 
 // Bakes each connected piece's local bounds (center + half size) onto its vertices as the
 // `cCenter`/`cHalf` attributes. Vertices are merged by position, since loaders split them at UV
@@ -223,6 +231,26 @@ function bakePieceBounds(geometry) {
     parent[find(at(t + 1))] = a
     parent[find(at(t + 2))] = a
   }
+  // A closed solid shares every edge between exactly two triangles. Open pieces can't be capped
+  // reliably — small or thin ones (a cable strip, a door or window frame) leave stray black
+  // lines — so the shader skips open pieces that are thin or small across the cut. Large open
+  // pieces (walls and slabs with a face deleted, common in exports) still get capped.
+  const edges = new Map()
+  const edge = (a, b) => {
+    const k = a < b ? a * ids.size + b : b * ids.size + a
+    edges.set(k, (edges.get(k) ?? 0) + 1)
+  }
+  for (let t = 0; t < tris; t += 3) {
+    const a = at(t)
+    const b = at(t + 1)
+    const c = at(t + 2)
+    edge(a, b)
+    edge(b, c)
+    edge(c, a)
+  }
+  const open = new Set()
+  for (const [k, count] of edges) if (count !== 2) open.add(find(Math.floor(k / ids.size)))
+
   const min = new Map()
   const max = new Map()
   for (let i = 0; i < n; i++) {
@@ -239,10 +267,12 @@ function bakePieceBounds(geometry) {
   }
   const center = new Float32Array(n * 3)
   const half = new Float32Array(n * 3)
+  const isOpen = new Float32Array(n)
   for (let i = 0; i < n; i++) {
     const r = find(vid[i])
     const lo = min.get(r)
     const hi = max.get(r)
+    isOpen[i] = open.has(r) ? 1 : 0
     for (let j = 0; j < 3; j++) {
       center[i * 3 + j] = (lo[j] + hi[j]) / 2
       half[i * 3 + j] = (hi[j] - lo[j]) / 2
@@ -250,16 +280,19 @@ function bakePieceBounds(geometry) {
   }
   geometry.setAttribute('cCenter', new THREE.BufferAttribute(center, 3))
   geometry.setAttribute('cHalf', new THREE.BufferAttribute(half, 3))
+  geometry.setAttribute('cOpen', new THREE.BufferAttribute(isOpen, 1))
 }
 
-// Discards stencil fragments from pieces whose world bounds don't straddle the plane
-// (planes are axis-aligned: uAxis is the world axis, uValue the plane's position on it).
+// Discards stencil fragments from pieces whose world bounds don't straddle the plane, and from
+// open pieces thinner than uThin or smaller than uSmall across it (half-extents; planes are
+// axis-aligned: uAxis is the world axis, uValue the plane's position on it).
 function onlyCutPieces(material, uniforms) {
   material.customProgramCacheKey = () => 'section-stencil'
   material.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms)
     shader.vertexShader =
-      'attribute vec3 cCenter;\nattribute vec3 cHalf;\nuniform int uAxis;\nuniform float uValue;\nvarying float vCut;\n' +
+      'attribute vec3 cCenter;\nattribute vec3 cHalf;\nattribute float cOpen;\n' +
+      'uniform int uAxis;\nuniform float uValue;\nuniform float uThin;\nuniform float uSmall;\nvarying float vCut;\n' +
       shader.vertexShader.replace(
         '#include <begin_vertex>',
         `#include <begin_vertex>
@@ -268,7 +301,9 @@ function onlyCutPieces(material, uniforms) {
         vec3 we = abs(m[0]) * cHalf.x + abs(m[1]) * cHalf.y + abs(m[2]) * cHalf.z;
         float c = uAxis == 0 ? wc.x : (uAxis == 1 ? wc.y : wc.z);
         float e = uAxis == 0 ? we.x : (uAxis == 1 ? we.y : we.z);
-        vCut = abs(uValue - c) < e ? 1.0 : 0.0;`
+        vec2 across = uAxis == 0 ? we.yz : (uAxis == 1 ? we.xz : we.xy);
+        bool skipOpen = cOpen > 0.5 && (min(across.x, across.y) < uThin || max(across.x, across.y) < uSmall);
+        vCut = abs(uValue - c) < e && !skipOpen ? 1.0 : 0.0;`
       )
     shader.fragmentShader =
       'varying float vCut;\n' + shader.fragmentShader.replace('void main() {', 'void main() {\n  if (vCut < 0.5) discard;')
@@ -291,43 +326,74 @@ function SectionCaps({ planes }) {
     return list
   }, [object])
   return planes.map((plane, i) => (
-    <SectionCap key={i} order={i + 1} plane={plane} others={planes.filter((p) => p !== plane)} meshes={meshes} size={bounds.radius * 4} />
+    <SectionCap
+      key={i}
+      order={i + 1}
+      plane={plane}
+      planes={planes}
+      others={planes.filter((p) => p !== plane)}
+      meshes={meshes}
+      size={bounds.radius * 4}
+    />
   ))
 }
 
-function SectionCap({ plane, others, meshes, order, size }) {
+function SectionCap({ plane, planes, others, meshes, order, size }) {
   const mats = useMemo(() => {
-    const back = new THREE.MeshBasicMaterial({ ...stencilBase, side: THREE.BackSide })
-    back.stencilFail = back.stencilZFail = back.stencilZPass = THREE.IncrementWrapStencilOp
-    const front = new THREE.MeshBasicMaterial({ ...stencilBase, side: THREE.FrontSide })
-    front.stencilFail = front.stencilZFail = front.stencilZPass = THREE.DecrementWrapStencilOp
+    // Test 2: visible back faces set the INSIDE bit. The offset keeps depths equal to the
+    // model's own back faces (same geometry) passing.
+    const visible = new THREE.MeshBasicMaterial({
+      ...stencilOff,
+      side: THREE.BackSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+      stencilRef: INSIDE,
+      stencilWriteMask: INSIDE,
+      stencilZPass: THREE.ReplaceStencilOp,
+    })
+    // Test 1: count along the whole ray (no depth test) in the low 7 bits.
+    const count = (side, op) =>
+      new THREE.MeshBasicMaterial({
+        ...stencilOff,
+        side,
+        depthTest: false,
+        stencilWriteMask: 0x7f,
+        stencilFail: op,
+        stencilZFail: op,
+        stencilZPass: op,
+      })
+    const back = count(THREE.BackSide, THREE.IncrementWrapStencilOp)
+    const front = count(THREE.FrontSide, THREE.DecrementWrapStencilOp)
+    // Passes where INSIDE < stencil: the bit is set and the count is non-zero.
     const cap = new THREE.MeshBasicMaterial({
       color: '#000000',
       side: THREE.DoubleSide,
       stencilWrite: true,
-      stencilRef: 0,
-      stencilFunc: THREE.NotEqualStencilFunc,
-      stencilFail: THREE.ReplaceStencilOp,
-      stencilZFail: THREE.ReplaceStencilOp,
-      stencilZPass: THREE.ReplaceStencilOp,
+      stencilRef: INSIDE,
+      stencilFunc: THREE.LessStencilFunc,
     })
-    const uniforms = { uAxis: { value: 1 }, uValue: { value: 0 } }
-    onlyCutPieces(back, uniforms)
-    onlyCutPieces(front, uniforms)
-    return { back, front, cap, uniforms }
+    const uniforms = { uAxis: { value: 1 }, uValue: { value: 0 }, uThin: { value: 0 }, uSmall: { value: 0 } }
+    for (const m of [visible, back, front]) onlyCutPieces(m, uniforms)
+    return { visible, back, front, cap, uniforms }
   }, [])
-  useEffect(() => () => [mats.back, mats.front, mats.cap].forEach((m) => m.dispose()), [mats])
+  useEffect(() => () => [mats.visible, mats.back, mats.front, mats.cap].forEach((m) => m.dispose()), [mats])
 
   // A mesh can mix opaque and glass materials (common in FBX); skip just the glass groups.
-  const materialFor = (m, side) =>
-    Array.isArray(m.userData.orig) ? m.userData.orig.map((x) => (x.transparent ? hiddenMaterial : mats[side])) : mats[side]
+  const materialFor = (m, pass) =>
+    Array.isArray(m.userData.orig) ? m.userData.orig.map((x) => (x.transparent ? hiddenMaterial : mats[pass])) : mats[pass]
 
+  // Test 2 is clipped exactly like the model, so it only sees back faces that are on screen.
+  mats.visible.clippingPlanes = planes
   mats.back.clippingPlanes = mats.front.clippingPlanes = [plane]
   mats.cap.clippingPlanes = others
   const n = plane.normal
   const axis = Math.abs(n.x) > 0.5 ? 0 : Math.abs(n.y) > 0.5 ? 1 : 2
   mats.uniforms.uAxis.value = axis
   mats.uniforms.uValue.value = -plane.constant / n.getComponent(axis)
+  // Half-extents, relative to the model's radius r (size = 4r): thin < 0.2% r, small < 5% r.
+  mats.uniforms.uThin.value = size * 0.0005
+  mats.uniforms.uSmall.value = size * 0.0125
 
   const position = plane.coplanarPoint(new THREE.Vector3())
   capQuat.setFromUnitVectors(Z, plane.normal)
@@ -335,16 +401,16 @@ function SectionCap({ plane, others, meshes, order, size }) {
   return (
     <>
       {meshes.map((m) =>
-        ['back', 'front'].map((side) => (
+        ['visible', 'back', 'front'].map((pass, j) => (
           <mesh
-            key={m.uuid + side}
+            key={m.uuid + pass}
             geometry={m.geometry}
-            material={materialFor(m, side)}
+            material={materialFor(m, pass)}
             // Pinned to the model mesh's world transform (the model is static once prepared).
             ref={(o) => o?.matrixWorld.copy(m.matrixWorld)}
             matrixAutoUpdate={false}
             matrixWorldAutoUpdate={false}
-            renderOrder={order}
+            renderOrder={order + j * 0.01}
             raycast={() => null}
             dispose={null} // shares the model's geometry; must not dispose it on unmount
           />
